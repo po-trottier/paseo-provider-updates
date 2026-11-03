@@ -1,0 +1,11 @@
+{
+  "id": "provider-updates",
+  "name": "Provider Updates",
+  "description": "Show a composer pill when a provider CLI update is available, and install it with one click.",
+  "media": [
+    "https://raw.githubusercontent.com/po-trottier/paseo-provider-updates/main/assets/update-pill.png"
+  ],
+  "requirements": {
+    "paseo": ">=0.14.0"
+  }
+}
