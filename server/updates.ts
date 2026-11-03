@@ -146,15 +146,18 @@ export async function classify(
     };
   }
 
-  const brew = /[\\/](Cellar|Caskroom)[\\/]([^\\/]+)[\\/]([^\\/]+)[\\/]/.exec(path);
+  const brew = /[\\/](Cellar|Caskroom)[\\/]([^\\/]+)[\\/]/.exec(path);
   if (brew && BREW_NAME.test(brew[2])) {
-    const [, kind, name, installed] = brew;
+    const [, kind, name] = brew;
     const flag = kind === "Caskroom" ? ["--cask"] : [];
     return {
       async check() {
+        // Read both versions from brew each time. The path that Paseo resolved still names the old version after an upgrade.
         const info = JSON.parse(await run(["brew", "info", "--json=v2", ...flag, name]));
-        const latest = kind === "Caskroom" ? info.casks?.[0]?.version : info.formulae?.[0]?.versions?.stable;
-        return [version(installed), version(String(latest))];
+        const [installed, latest] = kind === "Caskroom"
+          ? [info.casks?.[0]?.installed, info.casks?.[0]?.version]
+          : [info.formulae?.[0]?.linked_keg ?? info.formulae?.[0]?.installed?.at(-1)?.version, info.formulae?.[0]?.versions?.stable];
+        return [version(String(installed)), version(String(latest))];
       },
       update: ["brew", "upgrade", ...flag, name],
     };
