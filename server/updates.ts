@@ -1,7 +1,8 @@
-import { exec } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { exec, execFile, type ExecException } from "node:child_process";
+import { readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { promisify } from "node:util";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import { z } from "zod";
 import type { ProviderUpdate, UpdatesState } from "../shared/updates";
@@ -13,16 +14,33 @@ const POLL_WAIT_MS = 20_000;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-function run(command: string, timeout = POLL_WAIT_MS): Promise<string> {
-  // Constant commands only. The shell resolves npm shims such as codex.cmd on Windows.
-  // The lib target is ES2023, so Promise.withResolvers is not typed here.
-  return new Promise((resolve, reject) => {
-    exec(command, { timeout, windowsHide: true }, (error, stdout, stderr) => {
-      const output = `${stdout}\n${stderr}`.trim();
-      if (error) reject(new Error(`${command} failed: ${output.slice(-500) || error.message}`));
-      else resolve(output);
-    });
-  });
+const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+async function run(
+  command: readonly string[],
+  timeout = POLL_WAIT_MS,
+  env?: Record<string, string>,
+  acceptExitOne = false,
+): Promise<string> {
+  const options = { timeout, windowsHide: true, env: { ...process.env, ...env }, encoding: "utf8" as const };
+  try {
+    let output;
+    if (process.platform === "win32" && command[0] === "npm") {
+      // npm.cmd needs a shell. Only these fixed argument shapes enter it.
+      const root = command.length === 3 && command[1] === "root" && command[2] === "-g";
+      const install = command.length === 4 && command[1] === "install" && command[2] === "-g" &&
+        command[3].endsWith("@latest") && NPM_NAME.test(command[3].slice(0, -7));
+      if (!root && !install) throw new Error("Invalid npm command");
+      output = await execAsync(command.join(" "), options);
+    } else output = await execFileAsync(command[0], command.slice(1), options);
+    return output.stdout.trim() || output.stderr.trim();
+  } catch (error) {
+    const failure = error as ExecException & { stdout?: string; stderr?: string };
+    if (acceptExitOne && failure.code === 1) return failure.stdout?.trim() || failure.stderr?.trim() || "";
+    const output = `${failure.stdout ?? ""}\n${failure.stderr ?? ""}`.trim();
+    throw new Error(`${command.join(" ")} failed: ${output.slice(-500) || failure.message}`);
+  }
 }
 
 function version(text: string): string {
@@ -59,26 +77,127 @@ async function claudeLatest(): Promise<string> {
   return version(await fetchText(`${CLAUDE_RELEASES}/${channel}`));
 }
 
-// Each entry reads the installed and the latest version, and names the provider's own update command.
-const PROVIDERS: Record<string, { check(): Promise<[string, string]>; update: string }> = {
-  claude: {
-    check: async () => [version(await run("claude --version")), await claudeLatest()],
-    update: "claude update",
-  },
-  codex: {
-    check: async () => [version(await run("codex --version")), await npmLatest("@openai/codex")],
-    update: "codex update",
-  },
-  omp: {
+type Updater = { label: string; check(): Promise<[string, string]>; update: readonly string[] };
+
+const NPM_NAME = /^(?:@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/i;
+const BREW_NAME = /^[\w@.+-]+$/;
+
+// Runners that download the package at each launch. They need no update.
+const LAUNCHERS = /^(npx|bunx|pnpx|uvx)(\.\w+)?$/i;
+
+// Providers that update themselves when they are not installed by npm or Homebrew.
+const NATIVE: Record<string, (exe: string) => Pick<Updater, "check" | "update">> = {
+  claude: (exe) => ({
+    check: async () => [version(await run([exe, "--version"])), await claudeLatest()],
+    update: [exe, "update"],
+  }),
+  omp: (exe) => ({
     async check() {
-      const out = await run("omp update --check");
+      const out = await run([exe, "update", "--check"]);
       const current = version(/Current version:.*/.exec(out)?.[0] ?? out);
       const available = /New version available:.*/.exec(out)?.[0];
       return [current, available ? version(available) : current];
     },
-    update: "omp update",
-  },
+    update: [exe, "update"],
+  }),
 };
+
+let npmRoot: Promise<string> | undefined;
+
+/** The global npm package that holds `path`, directly or through an npm shim. */
+async function npmPackage(path: string): Promise<{ pkg: string; dir: string } | undefined> {
+  const inside = /^(.*?[\\/]node_modules[\\/])((?:@[^\\/]+[\\/])?[^\\/]+)/.exec(path);
+  let found = inside && { pkg: inside[2], dir: inside[1] + inside[2] };
+  if (!found && (await stat(path)).size < 64_000) {
+    // npm shims on Windows (.cmd, .ps1, sh) name the package script relative to the shim folder.
+    const shim = /node_modules[\\/]((?:@[^\\/"']+[\\/])?[^\\/"']+)[\\/]/.exec(await readFile(path, "utf8"));
+    if (shim) found = { pkg: shim[1], dir: join(dirname(path), "node_modules", shim[1]) };
+  }
+  if (!found) return undefined;
+  const pkg = found.pkg.replace("\\", "/");
+  // A package in a project folder is not a global install, so `npm install -g` does not update it.
+  npmRoot ??= run(["npm", "root", "-g"]).catch(() => "");
+  const root = (await npmRoot).toLowerCase();
+  if (!NPM_NAME.test(pkg) || !root || !join(found.dir).toLowerCase().startsWith(join(root).toLowerCase())) return undefined;
+  return { pkg, dir: found.dir };
+}
+
+const field = (text: string, name: string) => new RegExp(`^\\s*${name}: (.+)$`, "m").exec(text)?.[1].trim();
+const unknown = new Set<string>();
+
+/** Finds how the provider was installed, from the command and binary that Paseo resolves. */
+export async function classify(
+  provider: string,
+  command: string | undefined,
+  resolved: string | undefined,
+): Promise<Pick<Updater, "check" | "update"> | "launcher" | undefined> {
+  if (command && LAUNCHERS.test(basename(command.trim().split(/\s+/)[0]))) return "launcher";
+  if (!resolved) return undefined;
+  const path = await realpath(resolved).catch(() => resolved);
+
+  const npm = await npmPackage(path).catch(() => undefined);
+  if (npm) {
+    return {
+      async check() {
+        const manifest = JSON.parse(await readFile(join(npm.dir, "package.json"), "utf8"));
+        return [version(z.object({ version: z.string() }).parse(manifest).version), await npmLatest(npm.pkg)];
+      },
+      update: ["npm", "install", "-g", `${npm.pkg}@latest`],
+    };
+  }
+
+  const brew = /[\\/](Cellar|Caskroom)[\\/]([^\\/]+)[\\/]([^\\/]+)[\\/]/.exec(path);
+  if (brew && BREW_NAME.test(brew[2])) {
+    const [, kind, name, installed] = brew;
+    const flag = kind === "Caskroom" ? ["--cask"] : [];
+    return {
+      async check() {
+        const info = JSON.parse(await run(["brew", "info", "--json=v2", ...flag, name]));
+        const latest = kind === "Caskroom" ? info.casks?.[0]?.version : info.formulae?.[0]?.versions?.stable;
+        return [version(installed), version(String(latest))];
+      },
+      update: ["brew", "upgrade", ...flag, name],
+    };
+  }
+
+  const native = NATIVE[provider];
+  if (native) return native(path);
+  if (!unknown.has(`${provider}:${path}`)) {
+    unknown.add(`${provider}:${path}`);
+    console.log(`[provider-updates] ${provider}: unknown install method (${path}), no update check`);
+  }
+  return undefined;
+}
+
+/** Every enabled and ready Paseo provider that this plugin can update. */
+async function discover(paseo: Paseo): Promise<Map<string, Updater>> {
+  const { entries } = await paseo.providers.waitForReady();
+  const found = new Map<string, Updater>();
+  await Promise.all(
+    entries
+      .filter((entry) => entry.enabled && entry.status === "ready")
+      .map(async (entry) => {
+        try {
+          const { diagnostic } = await paseo.providers.diagnostic(entry.provider);
+          const updater = await classify(entry.provider, field(diagnostic, "Configured command"), field(diagnostic, "Resolved path"));
+          if (updater && updater !== "launcher") found.set(entry.provider, { label: entry.label ?? entry.provider, ...updater });
+        } catch (error) {
+          console.error(`[provider-updates] ${entry.provider} discovery failed:`, error);
+        }
+      }),
+  );
+  return found;
+}
+
+let updaters = new Map<string, Updater>();
+let api: Paseo | undefined;
+
+/** Plugin contribution has no SDK handle, so checks start with the first client RPC. */
+export function useApi(paseo: Paseo): void {
+  const first = !api;
+  api = paseo;
+  if (first) void checkAll();
+}
 
 /** Paseo provider ids can carry a model, such as "codex/gpt-5.5". */
 export const providerId = (provider: string) => provider.split("/")[0];
@@ -86,7 +205,7 @@ export const providerId = (provider: string) => provider.split("/")[0];
 // All state is in memory. A daemon restart starts every provider process again, so nothing is stale after it.
 const available = new Map<string, ProviderUpdate>();
 const installs = new Map<string, Promise<void>>();
-const installed = new Map<string, { version: string; at: number }>();
+const installed = new Map<string, { label: string; version: string; at: number }>();
 const sessions = new Map<string, { provider: string; openedAt: number }>();
 // "Restart now" chosen while the provider installs. reload() runs when the install succeeds.
 const restartAfterInstall = new Set<string>();
@@ -110,7 +229,7 @@ function snapshot(): UpdatesState {
   return {
     updates: [...available.values()],
     installing: [...installs.keys()],
-    installed: [...installed].map(([provider, { version }]) => ({ provider, version })),
+    installed: [...installed].map(([provider, { label, version }]) => ({ provider, label, version })),
     stale: [...sessions.keys()].filter((id) => isStale(id) && !restarting.has(id)),
     queued: [...restartAfterInstall],
   };
@@ -128,9 +247,11 @@ export async function watch(since: number): Promise<{ revision: number; state: U
 }
 
 async function checkOne(provider: string): Promise<string | undefined> {
+  const updater = updaters.get(provider);
   try {
-    const [current, latest] = await PROVIDERS[provider].check();
-    if (isNewer(latest, current)) available.set(provider, { provider, current, latest });
+    if (!updater) throw new Error("not discovered");
+    const [current, latest] = await updater.check();
+    if (isNewer(latest, current)) available.set(provider, { provider, label: updater.label, current, latest });
     else available.delete(provider);
     return current;
   } catch (error) {
@@ -144,7 +265,12 @@ async function checkOne(provider: string): Promise<string | undefined> {
 }
 
 export async function checkAll(): Promise<void> {
-  await Promise.all(Object.keys(PROVIDERS).map(checkOne));
+  if (!api) return;
+  updaters = await discover(api);
+  console.log(`[provider-updates] checking: ${[...updaters].map(([id, u]) => `${id} (${u.update.join(" ")})`).join(", ") || "none"}`);
+  for (const provider of available.keys()) if (!updaters.has(provider)) available.delete(provider);
+  changed();
+  await Promise.all([...updaters.keys()].map(checkOne));
 }
 
 export function sessionOpened(agentId: string, provider: string): void {
@@ -190,8 +316,9 @@ async function forceRestart(agentId: string, paseo: Paseo): Promise<void> {
 
 /** Starts the update, or joins the one in progress. Returns false while it still runs. */
 export async function install(provider: string, restartAgentId: string | undefined, paseo: Paseo): Promise<boolean> {
-  const entry = PROVIDERS[provider];
+  const entry = updaters.get(provider);
   if (!entry) throw new Error(`No updater for provider "${provider}"`);
+  const command = entry.update.join(" ");
   if (restartAgentId) {
     restartAfterInstall.add(restartAgentId);
     changed();
@@ -202,9 +329,9 @@ export async function install(provider: string, restartAgentId: string | undefin
       console.log(await run(entry.update, 10 * 60_000));
       const current = await checkOne(provider);
       const left = available.get(provider);
-      if (left) throw new Error(`${entry.update} finished, but ${provider} still reports ${left.current}`);
-      if (!current) throw new Error(`${entry.update} finished, but the ${provider} version check failed`);
-      installed.set(provider, { version: current, at: Date.now() });
+      if (left) throw new Error(`${command} finished, but ${provider} still reports ${left.current}`);
+      if (!current) throw new Error(`${command} finished, but the ${provider} version check failed`);
+      installed.set(provider, { label: entry.label, version: current, at: Date.now() });
       // Paseo reads the new version for new sessions.
       await paseo.providers.refresh();
     })();

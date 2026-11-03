@@ -39,11 +39,13 @@ export default function contribute(client: PluginClientContext) {
 
     if (update && state.installing.includes(p)) {
       return {
-        key: `installing ${update.latest} ${queued}`,
+        key: `installing ${update.label} ${update.latest} ${queued}`,
         button: {
-          title: queued ? `Installing ${p} ${update.latest}, then restarting this session` : `Installing ${p} ${update.latest}`,
+          title: queued
+            ? `Installing ${update.label} ${update.latest}, then restarting this session`
+            : `Installing ${update.label} ${update.latest}`,
           icon: "Loader",
-          label: `Updating ${p}…`,
+          label: `Updating ${update.label}…`,
           disabled: !queued,
           behavior: queued
             ? { kind: "menu", items: [item("cancel", "Cancel the restart", "X", restart(agentId, "cancel"))] }
@@ -53,11 +55,11 @@ export default function contribute(client: PluginClientContext) {
     }
     if (installed && state.stale.includes(agentId)) {
       return {
-        key: `stale ${installed.version} ${running}`,
+        key: `stale ${installed.label} ${installed.version} ${running}`,
         button: {
-          title: `This session uses the old ${p}. Restart it to use ${installed.version}.`,
+          title: `This session uses the old ${installed.label}. Restart it to use ${installed.version}.`,
           icon: "RotateCw",
-          label: `Restart for ${p} ${installed.version}`,
+          label: `Restart for ${installed.label} ${installed.version}`,
           behavior: {
             kind: "menu",
             items: [
@@ -70,11 +72,11 @@ export default function contribute(client: PluginClientContext) {
     }
     if (update) {
       return {
-        key: `update ${update.latest} ${running}`,
+        key: `update ${update.label} ${update.latest} ${running}`,
         button: {
-          title: `Update ${p} ${update.current} → ${update.latest}`,
+          title: `Update ${update.label} ${update.current} → ${update.latest}`,
           icon: "Download",
-          label: `${p} ${update.latest} available`,
+          label: `${update.label} ${update.latest} available`,
           behavior: {
             kind: "menu",
             items: [

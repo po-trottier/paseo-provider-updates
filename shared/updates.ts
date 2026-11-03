@@ -1,7 +1,7 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
-const providerUpdate = z.object({ provider: z.string(), current: z.string(), latest: z.string() });
+const providerUpdate = z.object({ provider: z.string(), label: z.string(), current: z.string(), latest: z.string() });
 export type ProviderUpdate = z.infer<typeof providerUpdate>;
 
 const updatesState = z.object({
@@ -10,7 +10,7 @@ const updatesState = z.object({
   /** Providers whose update command runs now. */
   installing: z.array(z.string()),
   /** Versions this plugin installed since the daemon started. */
-  installed: z.array(z.object({ provider: z.string(), version: z.string() })),
+  installed: z.array(z.object({ provider: z.string(), label: z.string(), version: z.string() })),
   /** Agents whose open session started before its provider was updated. */
   stale: z.array(z.string()),
   /** Agents with "Restart now" that wait for the install in progress. */

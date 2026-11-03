@@ -1,5 +1,5 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { checkAll, install, restart, sessionClosed, sessionOpened, watch } from "./server/updates";
+import { checkAll, install, restart, sessionClosed, sessionOpened, useApi, watch } from "./server/updates";
 import * as rpc from "./shared/updates";
 
 const CHECK_INTERVAL_MS = 60 * 60 * 1000;
@@ -14,7 +14,10 @@ export default function contribute(server: PluginServerContext) {
   server.on("agent.closed", ({ agent }) => sessionClosed(agent.id));
   server.on("agent.archived", ({ agent }) => sessionClosed(agent.id));
 
-  server.handle(rpc.watchState, ({ revision }) => watch(revision));
+  server.handle(rpc.watchState, ({ revision }, { paseo }) => {
+    useApi(paseo);
+    return watch(revision);
+  });
   server.handle(rpc.installUpdate, async ({ provider, restartAgentId }, { paseo }) => ({
     done: await install(provider, restartAgentId, paseo),
   }));
@@ -23,7 +26,6 @@ export default function contribute(server: PluginServerContext) {
     return {};
   });
 
-  void checkAll();
   const timer = setInterval(() => void checkAll(), CHECK_INTERVAL_MS);
   return () => clearInterval(timer);
 }

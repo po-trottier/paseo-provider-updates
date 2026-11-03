@@ -1,14 +1,17 @@
 Shows a pill above the composer when a newer version of the agent's provider CLI is available. Click the pill to install the update on the daemon machine.
 
-The daemon checks Claude Code, Codex and Oh My Pi once an hour:
+The daemon checks every enabled and ready Paseo provider: built-in, ACP and custom. Checks start when the first Paseo client connects, then run once an hour. The install method of the executable that Paseo resolves selects the version check and the update command:
 
-| Provider | Installed version | Latest version | Update command |
-| --- | --- | --- | --- |
-| `claude` | `claude --version` | Claude Code release channel from `autoUpdatesChannel` (`latest` or `stable`) | `claude update` |
-| `codex` | `codex --version` | npm `@openai/codex` | `codex update` |
-| `omp` | `omp update --check` | `omp update --check` | `omp update` |
+| Install method | Latest version | Update command |
+| --- | --- | --- |
+| Global npm package | npm registry `latest` | `npm install -g <pkg>@latest` |
+| Homebrew formula or cask | `brew info --json=v2` | `brew upgrade [--cask] <name>` |
+| Native Claude Code | Release channel from `autoUpdatesChannel` (`latest` or `stable`) | `claude update` |
+| Native OMP | `omp update --check` | `omp update` |
 
-A provider that is not installed, or that the daemon cannot check, shows no pill. An update can run for 10 minutes.
+A provider that starts with `npx`, `bunx`, `pnpx` or `uvx` shows no pill, because these runners download the package at launch. Other install methods also show no pill, and the plugin logs them once.
+
+An update can run for 10 minutes.
 
 ## Pill states
 
@@ -28,4 +31,3 @@ An update never stops a session by itself. The session keeps the old binary unti
 - If you set `agents.idleRuntimeCleanup` to `false`, Paseo never closes idle sessions. Use "restart now".
 - Paseo reopens open sessions before their next prompt when this plugin loads or reloads, because the plugin records each session start.
 - Only updates installed through the pill mark sessions as old. An update from a terminal does not.
-- The plugin runs `claude`, `codex` and `omp` from the daemon `PATH`. A custom provider binary in Paseo settings is not checked.
